@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gemma4 Snake AI</title>
+    <style>
+        body {
+            background: #1a1a2e;
+            color: #e0e0e0;
+            font-family: monospace;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 24px;
+            margin: 0;
+        }
+        h1 { color: #a8dadc; margin-bottom: 8px; }
+        #controls {
+            display: flex;
+            gap: 24px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        #status { font-size: 1rem; }
+        #score  { font-size: 1rem; }
+        button {
+            background: #457b9d;
+            color: #fff;
+            border: none;
+            padding: 8px 20px;
+            font-size: 1rem;
+            font-family: monospace;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        button:hover { background: #1d3557; }
+        canvas {
+            border: 2px solid #457b9d;
+            display: block;
+        }
+    </style>
+</head>
+<body>
+    <h1>Gemma4 Snake AI</h1>
+    <div id="controls">
+        <span id="status">Waiting for simulation…</span>
+        <span id="score">Score: 0</span>
+        <button id="restart">Restart</button>
+    </div>
+    <canvas id="game" width="600" height="600"></canvas>
+    <script src="game.js"></script>
+</body>
+</html>

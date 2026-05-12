@@ -13,8 +13,10 @@ import dev.denisarruda.gemmasnakeai.game.entity.GameState;
 import dev.denisarruda.gemmasnakeai.game.entity.GameStatus;
 import dev.denisarruda.gemmasnakeai.simulation.boundary.GameBroadcaster;
 import dev.denisarruda.gemmasnakeai.simulation.entity.SimulationRun;
+import io.quarkus.runtime.StartupEvent;
 import io.quarkus.scheduler.Scheduled;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
 
@@ -51,11 +53,26 @@ public class SimulationRunner {
         this.mapper = mapper;
     }
 
+    void onStart(@Observes StartupEvent ev) {
+        startRun(generateId());
+        LOGGER.log(System.Logger.Level.INFO, "Auto-started initial simulation");
+    }
+
+    private static String generateId() {
+        return java.util.UUID.randomUUID().toString().substring(0, 8);
+    }
+
     public GameState startRun(String runId) {
         session.start(runId);
         var initial = session.snapshot();
         runs.put(runId, SimulationRun.started(runId, initial));
+        broadcaster.broadcast(renderStateJson(initial));
         return initial;
+    }
+
+    public String currentStateJson() {
+        if (session.runId == null) return null;
+        return renderStateJson(session.snapshot());
     }
 
     public Optional<SimulationRun> getRun(String id) {

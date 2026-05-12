@@ -5,50 +5,166 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Gemma4 Snake AI</title>
     <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
         body {
-            background: #1a1a2e;
+            background: #0d0d1a;
             color: #e0e0e0;
-            font-family: monospace;
+            font-family: 'Courier New', monospace;
             display: flex;
             flex-direction: column;
             align-items: center;
             padding: 24px;
-            margin: 0;
+            gap: 16px;
         }
-        h1 { color: #a8dadc; margin-bottom: 8px; }
-        #controls {
+
+        h1 {
+            font-size: 1.4rem;
+            letter-spacing: 0.15em;
+            color: #a0c4ff;
+            text-transform: uppercase;
+        }
+
+        #canvas-wrapper {
+            border: 1px solid #2a2a5a;
+            box-shadow: 0 0 24px rgba(100, 120, 255, 0.15);
+        }
+
+        canvas { display: block; }
+
+        #hud {
             display: flex;
-            gap: 24px;
-            align-items: center;
-            margin-bottom: 16px;
+            gap: 32px;
+            font-size: 0.85rem;
+            color: #888;
         }
-        #status { font-size: 1rem; }
-        #score  { font-size: 1rem; }
+
+        #hud span { color: #c0c0ff; }
+
+        #status-dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            background: #555;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+        #status-dot.connected { background: #00ff88; box-shadow: 0 0 6px #00ff88; }
+        #status-dot.error     { background: #ff4455; }
+
         button {
-            background: #457b9d;
-            color: #fff;
-            border: none;
-            padding: 8px 20px;
-            font-size: 1rem;
-            font-family: monospace;
+            background: transparent;
+            border: 1px solid #2a2a5a;
+            color: #a0c4ff;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            letter-spacing: 0.1em;
+            padding: 6px 20px;
             cursor: pointer;
-            border-radius: 4px;
+            text-transform: uppercase;
         }
-        button:hover { background: #1d3557; }
-        canvas {
-            border: 2px solid #457b9d;
-            display: block;
-        }
+        button:hover { border-color: #a0c4ff; box-shadow: 0 0 8px rgba(160,196,255,0.3); }
     </style>
 </head>
 <body>
-    <h1>Gemma4 Snake AI</h1>
-    <div id="controls">
-        <span id="status">Waiting for simulation…</span>
-        <span id="score">Score: 0</span>
-        <button id="restart">Restart</button>
-    </div>
-    <canvas id="game" width="600" height="600"></canvas>
-    <script src="game.js"></script>
+
+<h1>Gemma4 Snake AI</h1>
+
+<div id="canvas-wrapper">
+    <canvas id="game"></canvas>
+</div>
+
+<button onclick="restart()">Restart</button>
+
+<div id="hud">
+    <div><span id="status-dot"></span><span id="status-text">Connecting…</span></div>
+    <div>Tick: <span id="tick">—</span></div>
+    <div>Score: <span id="score">0</span></div>
+</div>
+
+<script>
+    const GRID       = 30;
+    const CELL       = 20;
+    const BG         = '#0d0d1a';
+    const GRID_LINE  = '#1a1a3a';
+    const FOOD_COLOR = '#ff6060';
+    const SNAKE_COLOR      = '#00ff88';
+    const SNAKE_HEAD_COLOR = '#80ffb8';
+
+    const canvas = document.getElementById('game');
+    canvas.width  = GRID * CELL;
+    canvas.height = GRID * CELL;
+    const ctx = canvas.getContext('2d');
+
+    drawEmpty();
+
+    function drawEmpty() {
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.strokeStyle = GRID_LINE;
+        ctx.lineWidth = 0.5;
+        for (let i = 0; i <= GRID; i++) {
+            ctx.beginPath(); ctx.moveTo(i * CELL, 0);           ctx.lineTo(i * CELL, canvas.height); ctx.stroke();
+            ctx.beginPath(); ctx.moveTo(0,         i * CELL);   ctx.lineTo(canvas.width, i * CELL);  ctx.stroke();
+        }
+    }
+
+    function drawFood(foods) {
+        ctx.fillStyle = FOOD_COLOR;
+        (foods ?? []).forEach(f => {
+            ctx.beginPath();
+            ctx.arc(f.x * CELL + CELL / 2, f.y * CELL + CELL / 2, CELL / 2 - 3, 0, Math.PI * 2);
+            ctx.fill();
+        });
+    }
+
+    function drawSnakes(snakes) {
+        (snakes ?? []).forEach(snake => {
+            (snake.cells ?? []).forEach((cell, i) => {
+                ctx.fillStyle = !snake.alive ? '#444' : (i === 0 ? SNAKE_HEAD_COLOR : SNAKE_COLOR);
+                ctx.globalAlpha = i === 0 ? 1.0 : 0.7;
+                ctx.fillRect(cell.x * CELL + 1, cell.y * CELL + 1, CELL - 2, CELL - 2);
+            });
+            ctx.globalAlpha = 1;
+        });
+    }
+
+    function render(state) {
+        drawEmpty();
+        drawFood(state.foods);
+        drawSnakes(state.snakes);
+
+        document.getElementById('tick').textContent  = state.tick;
+        document.getElementById('score').textContent = (state.snakes ?? []).reduce((s, sn) => s + (sn.score ?? 0), 0);
+
+        const allDead = (state.snakes ?? []).every(s => !s.alive);
+        if (allDead) {
+            setTimeout(restart, 2000);
+        }
+    }
+
+    const dot        = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+
+    function setStatus(label, cls) {
+        dot.className          = cls;
+        statusText.textContent = label;
+    }
+
+    function connect() {
+        const ws = new WebSocket(`ws://${location.host}/ws/game`);
+        ws.onopen    = () => setStatus('Connected', 'connected');
+        ws.onclose   = () => { setStatus('Reconnecting…', ''); setTimeout(connect, 2000); };
+        ws.onerror   = () => setStatus('Error', 'error');
+        ws.onmessage = e  => render(JSON.parse(e.data));
+    }
+
+    function restart() {
+        fetch('/game/restart', { method: 'POST' })
+            .catch(err => console.error('Restart failed', err));
+    }
+
+    connect();
+</script>
 </body>
 </html>

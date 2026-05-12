@@ -25,11 +25,12 @@ public class GameBroadcaster {
         connections.forEach(conn -> sendSafely(conn, json));
     }
 
-    private static void sendSafely(WebSocketConnection conn, String json) {
-        conn.sendText(json)
-            .subscribe().with(
-                v -> {},
-                err -> LOGGER.log(System.Logger.Level.WARNING, "WS send failed", err)
-            );
+    void sendSafely(WebSocketConnection conn, String json) {
+        try {
+            conn.sendText(json).await().indefinitely();
+        } catch (Exception e) {
+            LOGGER.log(System.Logger.Level.WARNING, "WS send failed, removing connection: {0}", e.getMessage());
+            connections.remove(conn);
+        }
     }
 }

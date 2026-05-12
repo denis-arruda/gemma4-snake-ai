@@ -11,9 +11,9 @@ A Quarkus-based Snake game simulation in which a **LangChain4j AI agent** backed
 | Concern | Choice |
 |---|---|
 | Runtime | Quarkus (latest) |
-| Language | Java 26 |
+| Language | Java 26, virtual threads |
 | Build | Maven (single module), Maven Wrapper (`./mvnw`) — always use `./mvnw`, never bare `mvn` |
-| REST | Jakarta RESTful Web Services (JAX-RS) |
+| REST | Jakarta RESTful Web Services (JAX-RS) via `quarkus-rest` |
 | JSON | Jackson (`quarkus-rest-jackson`) |
 | AI model | Google Gemini `gemini-4-flash` |
 | AI framework | LangChain4j (`quarkus-langchain4j-ai-gemini`) |
@@ -28,8 +28,8 @@ A Quarkus-based Snake game simulation in which a **LangChain4j AI agent** backed
 
 ## Game Rules
 
-- Grid: **30 × 30** cells, origin `(0,0)` at top-left.
-- The snake starts with length 3 at the centre, heading RIGHT.
+- Grid: **30 × 30** cells, origin `(0,0)` at top-left, `x` increases right, `y` increases down.
+- The snake spawns at a **random position and direction**, with a margin that ensures it fits within the grid at the configured initial length.
 ### Food
 
 | Rule | Detail |
@@ -55,12 +55,13 @@ A Quarkus-based Snake game simulation in which a **LangChain4j AI agent** backed
 
 | Rule | Detail |
 |---|---|
-| **Fixed interval** | The engine advances the game on a configurable fixed tick interval (default 200 ms), driven by Quarkus Scheduler. |
+| **Fixed interval** | The engine advances the game on a configurable fixed tick interval (default 200 ms), driven by Quarkus Scheduler (`@Scheduled(every = "${game.tick.interval:200ms}")`). |
 | **Continuous updates** | Every tick the engine applies the latest known direction, updates positions, checks collisions, and resolves food events — regardless of agent activity. |
-| **Latest-known decision** | The engine reads whichever direction the agent last provided. If no new decision has arrived since the previous tick, the previous direction is reused (straight ahead). |
-| **Non-blocking** | The engine never waits for an agent response. Agent calls are fired asynchronously; when a response arrives it updates the stored direction atomically. The tick loop is never stalled by Gemini latency. |
+| **Latest-known decision** | The engine reads whichever direction the agent last provided (`AtomicReference<Direction> latestDirection` on `GameEngine`). If no new decision has arrived, the previous direction is reused (straight ahead). |
+| **Non-blocking** | The engine never waits for an agent response. Agent calls are fired on a virtual-thread executor after each tick; when a response arrives it updates `latestDirection` atomically. |
+| **Skipped ticks** | If a prior agent call is still in flight (`agentBusy` flag), no new call is dispatched that tick — the snake simply continues in its current direction. |
 
-Agent calls are dispatched in a separate thread after each tick using `CompletableFuture.runAsync`. The stored direction is held in an `AtomicReference<Direction>` on `GameSession`.
+`GameEngine` is `@ApplicationScoped` and holds `AtomicReference<Direction> latestDirection` and `AtomicBoolean agentBusy`. A dedicated `ExecutorService` (`Executors.newVirtualThreadPerTaskExecutor()`) runs agent calls off the scheduler thread.
 
 ---
 
@@ -69,38 +70,40 @@ Agent calls are dispatched in a separate thread after each tick using `Completab
 | Rule | Detail |
 |---|---|
 | **Asynchronous** | All communication between the engine and the agent is non-blocking. The engine never waits for an agent response before advancing the game. |
-| **Not every update** | The agent is not notified on every tick. If an agent call is already in flight, the tick is skipped — no new request is dispatched. |
-| **Latest state only** | Game state is held in a single-slot `AtomicReference<GameState>`. Each tick overwrites any pending (unprocessed) state. When the agent becomes free it reads whichever state is current, discarding anything stale. |
+| **Not every update** | The agent is not invoked on every tick. If an agent call is already in flight (`agentBusy == true`), the tick is skipped — no new request is dispatched. |
+| **Fire-and-forget** | The agent receives a `RenderState` snapshot captured at dispatch time. No pending-state queue is maintained; if multiple ticks elapse during a slow model call, the intermediate states are simply not processed by the agent. |
 
-### Single-slot mailbox pattern
+### Async dispatch pattern
 
 ```
-pendingState: AtomicReference<GameState>   ← overwritten every tick (latest wins)
-agentBusy:    AtomicBoolean                ← true while a Gemini call is in flight
+latestDirection: AtomicReference<Direction>   ← last parsed direction; null on restart
+agentBusy:       AtomicBoolean                ← true while a Gemini call is in flight
 
-On each tick:
-  pendingState.set(latestSnapshot)
-  if agentBusy.compareAndSet(false, true):
-      dispatch async agent call            ← only if agent is free
+On each tick (@Scheduled, virtual thread):
+  gameState.applyDirection(latestDirection.get())
+  gameState.advance()
+  state = gameState.toRenderState()
+  broadcaster.broadcast(serialize(state))
+  if snake alive AND agentBusy.compareAndSet(false, true):
+      AGENT_EXECUTOR.execute(() -> decideAsync(state))
 
-On agent completion:
-  latestDirection.set(parsedDirection)
-  next = pendingState.getAndSet(null)
-  if next != null:
-      dispatch async agent call            ← consume accumulated latest state immediately
-  else:
-      agentBusy.set(false)                 ← release; next tick will re-engage if needed
+decideAsync(state):
+  try:
+      raw = snakeAgent.decide(buildPrompt(state))
+      latestDirection.set(Direction.parse(raw))
+  finally:
+      agentBusy.set(false)
 ```
 
 ---
 
 ## AI Agent Design
 
-The agent is consulted asynchronously and only when free. It always processes the most recent game state — never a queued or stale one. Its direction response is applied by the engine on the next available tick.
+The agent is consulted asynchronously and only when free. Its direction response is applied by the engine on the next available tick.
 
 ### LangChain4j AI service
 
-The agent is a LangChain4j `@RegisterAiService @ApplicationScoped` interface. LangChain4j handles HTTP transport to Gemini; the prompt is constructed manually by `SimulationRunner` and passed as a single string argument. The model returns a plain-text word; `SimulationRunner.callAgent()` parses it via `Direction.valueOf(response.trim().toUpperCase())`. On any exception the caller falls back to the **current direction** (straight ahead).
+The agent is a LangChain4j `@RegisterAiService @ApplicationScoped` interface. LangChain4j handles HTTP transport to Gemini; the prompt is constructed manually by `GameEngine.buildPrompt(RenderState)` and passed as a single string argument. The model returns a plain-text word; it is parsed via `Direction.parse(raw)` (`trim().toUpperCase()` + `valueOf`). On any exception the current direction is kept unchanged.
 
 ```java
 @RegisterAiService
@@ -108,15 +111,22 @@ The agent is a LangChain4j `@RegisterAiService @ApplicationScoped` interface. La
 public interface SnakeAgent {
 
     @SystemMessage("""
-        You are controlling a snake on a 30x30 grid.
-        Grid origin (0,0) is top-left. X increases right, Y increases down.
+        You are controlling a snake in a grid-based game.
+        Each turn you receive the game state with every move pre-evaluated as safe or lethal.
+        Never choose a move marked WALL or BODY — the snake dies immediately.
+        Prefer moves with more steps to the nearest wall.
+        Move toward visible food when it is safe to do so.
         Respond with exactly one word: UP DOWN LEFT RIGHT.
         """)
     String decide(@UserMessage String stateDescription);
 }
 ```
 
-The `stateDescription` is a plain-text string built by `SimulationRunner.buildPrompt(GameState)` containing the head position, body, food positions, current direction, score, and step number.
+The `stateDescription` built by `GameEngine.buildPrompt(RenderState)` contains:
+- Grid dimensions, coordinate convention, and current snake direction.
+- Head position.
+- All four candidate moves with a safety label (`safe` / `WALL — instant death` / `BODY — instant death`) and steps-to-wall distance.
+- Food positions.
 
 ---
 
@@ -126,77 +136,44 @@ Top-level package: `dev.denisarruda.gemmasnakeai`
 
 ```
 dev.denisarruda.gemmasnakeai
-├── game                      ← game domain BC
-│   ├── entity
-│   │   ├── Direction         (enum: UP, DOWN, LEFT, RIGHT — carries Δx/Δy)
-│   │   ├── Cell              (record: int x, int y)
-│   │   ├── Snake             (entity: deque of cells, direction, grew flag)
-│   │   ├── Food              (record: Cell position)
-│   │   └── GameState         (record: snapshot — snake, food, score, step, status)
-│   ├── control
-│   │   ├── GameEngine        (interface: static tick, isCollision, nextHead logic)
-│   │   └── FoodPlacer        (interface: static random-empty-cell logic)
-│   └── boundary
-│       └── GameSession       (@ApplicationScoped: mutable game lifecycle; holds AtomicReference<Direction> latestDirection, AtomicReference<GameState> pendingState, AtomicBoolean agentBusy)
-│
 ├── agent                     ← AI agent BC
 │   └── boundary
-│       └── SnakeAgent        (@RegisterAiService @ApplicationScoped: LangChain4j interface — @SystemMessage + @UserMessage String decide(), returns String; caller parses to Direction)
+│       └── SnakeAgent        (@RegisterAiService @ApplicationScoped: LangChain4j interface — @SystemMessage + @UserMessage String decide(), returns String; GameEngine parses to Direction)
 │
-└── simulation                ← orchestration BC
-    ├── entity
-    │   ├── SimulationRun     (record: id, list of GameState snapshots, final score)
-    │   └── SimulationStatus  (enum: RUNNING, COMPLETED, ERROR)
-    ├── control
-    │   └── SimulationRunner  (@Scheduled: fixed-interval tick — applies latest direction, fires async agent call, records snapshot)
-    ├── boundary
-    │   ├── SimulationsResource  (JAX-RS: POST /simulations, GET /simulations/{id})
-    │   └── GameSocket           (@WebSocket("/ws/game"): broadcasts render-state JSON on every tick)
+├── game                      ← game domain BC
+│   ├── entity
+│   │   ├── Direction         (enum: UP, DOWN, LEFT, RIGHT — static parse() method)
+│   │   ├── Snake             (mutable entity: ArrayList of Positions, direction, alive flag, score)
+│   │   ├── GameState         (@ApplicationScoped mutable state: snake, food list, tick counter)
+│   │   └── RenderState       (immutable record snapshot: tick, List<SnakeRender>, List<Position>)
+│   └── control
+│       └── GameEngine        (@ApplicationScoped: @Scheduled tick loop, prompt builder, async agent dispatch)
+│
+└── simulation                ← I/O boundary BC
+    └── boundary
+        ├── GameBroadcaster   (@ApplicationScoped: WebSocketConnection registry + broadcast)
+        ├── GameResource      (JAX-RS @Path("/game"): POST /game/restart)
+        └── GameSocket        (@WebSocket("/ws/game"): registers/unregisters connections via GameBroadcaster)
 ```
 
 ### Key design decisions
 
-- `GameEngine` and `FoodPlacer` are **interfaces with only static methods** — no instances, no CDI beans.
-- `GameSession` is `@ApplicationScoped` and holds a single mutable game; a simulation run clones snapshots into an immutable `SimulationRun` record after each step.
-- `SnakeAgent` is a LangChain4j AI service interface (`@RegisterAiService @ApplicationScoped`). LangChain4j owns HTTP transport to Gemini. The prompt is built manually in `SimulationRunner.buildPrompt()` and passed as a single `@UserMessage String`; the raw `String` response is parsed by `Direction.valueOf(response.trim().toUpperCase())`.
-- All JSON mapping happens in the boundary layer only.
+- `GameState` is `@ApplicationScoped` and holds a single mutable game. `GameEngine` calls `gameState.toRenderState()` each tick to produce an immutable `RenderState` snapshot for broadcast and prompt-building.
+- `SnakeAgent` is a LangChain4j AI service interface (`@RegisterAiService @ApplicationScoped`). LangChain4j owns HTTP transport to Gemini. The prompt is built manually in `GameEngine.buildPrompt()` and passed as a single `@UserMessage String`.
+- `GameBroadcaster` decouples the broadcast concern from the WebSocket lifecycle: `GameSocket` manages connection registration; `GameEngine` calls `broadcaster.broadcast()` without knowing about WebSocket details.
+- All JSON serialization happens in the boundary layer only.
 
 ---
 
 ## REST API
 
-Base path: `/simulations`
+Base path: `/game`
 
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/simulations` | Start a new simulation run. Returns run ID and initial state. |
-| `GET` | `/simulations/{id}` | Retrieve a completed or in-progress run (all snapshots). |
-| `POST` | `/simulations/restart` | Stop the current run (if any) and start a fresh one. Returns the new run's initial state. Used by the UI restart button. |
+| Method | Path | Body | Response | Description |
+|---|---|---|---|---|
+| `POST` | `/game/restart` | — | `204 No Content` | Reset the game: clears direction, resets state, spawns a new random snake. |
 
-The scheduler drives the game automatically — there are no manual step or run-to-completion endpoints.
-
-All responses use `application/json`. Request bodies (where present) use `application/json`.
-
-### Sample response — `POST /simulations`
-
-```json
-{
-  "id": "a1b2c3",
-  "status": "RUNNING",
-  "step": 0,
-  "score": 0,
-  "snake": {
-    "head": { "x": 15, "y": 15 },
-    "body": [
-      { "x": 15, "y": 15 },
-      { "x": 14, "y": 15 },
-      { "x": 13, "y": 15 }
-    ],
-    "direction": "RIGHT"
-  },
-  "food": { "x": 7, "y": 22 }
-}
-```
+The scheduler drives the game automatically — there are no manual step endpoints.
 
 ---
 
@@ -206,56 +183,59 @@ All responses use `application/json`. Request bodies (where present) use `applic
 
 | Concern | Detail |
 |---|---|
-| **Canvas** | HTML5 Canvas element sized to the 30×30 grid. Each cell maps to a fixed pixel block. |
-| **Snake colour** | Each snake is rendered in a distinct colour deterministically keyed to its `agentId` (e.g. HSL hue derived from a hash of the id). |
-| **Food markers** | Food items are rendered as distinct markers (e.g. filled circles) visually differentiated from snake segments. |
-| **Restart button** | A "Restart" button calls `POST /simulations/restart` via `fetch`. On success the canvas resets and the existing WebSocket connection continues receiving the new run's ticks immediately. |
-| **Served from** | Static files (`index.html`, `game.js`) served by Quarkus from `src/main/resources/META-INF/resources`. |
+| **Canvas** | `600 × 600 px` HTML5 Canvas (30 cells × 20 px/cell). |
+| **Grid lines** | Thin dark lines drawn each frame (`#1a1a3a`). |
+| **Snake** | Head cell brighter (`#80ffb8`), body semi-transparent (`#00ff88`, alpha 0.7). Dead snake renders grey (`#444`). |
+| **Food** | Filled red circles (`#ff6060`) centred in each cell. |
+| **HUD** | Connection status dot (green/red), tick counter, score. |
+| **Restart button** | Calls `POST /game/restart` via `fetch`. The WebSocket connection is unaffected and continues receiving ticks for the new game. |
+| **Auto-restart** | If all snakes are dead after a render frame, the client calls `restart()` after a 2 s delay. |
+| **Served from** | `src/main/resources/META-INF/resources/index.html` (single file, no build step). |
 
 ### WebSocket communication
 
 | Concern | Detail |
 |---|---|
-| **Endpoint** | Single WebSocket endpoint at `/ws/game`. |
-| **Direction** | Server → client only. The engine broadcasts a render-state JSON message on every tick. |
-| **Payload** | See render-state schema below. |
+| **Endpoint** | `ws://{host}/ws/game` |
+| **Direction** | Server → client only. The engine broadcasts a `RenderState` JSON message on every tick. |
+| **Reconnect** | Client reconnects automatically after 2 s on close. |
 
 ### Render-state JSON (server → client, every tick)
 
 ```json
 {
   "tick": 42,
-  "status": "RUNNING",
   "snakes": [
     {
-      "agentId": "agent-1",
-      "head": { "x": 15, "y": 15 },
-      "body": [{ "x": 15, "y": 15 }, { "x": 14, "y": 15 }, { "x": 13, "y": 15 }],
+      "agentId":   "agent-1",
+      "cells":     [{"x": 15, "y": 15}, {"x": 14, "y": 15}, {"x": 13, "y": 15}],
       "direction": "RIGHT",
-      "score": 3,
-      "alive": true
+      "alive":     true
     }
   ],
-  "food": [
-    { "x": 7, "y": 22 },
-    { "x": 3, "y": 5 }
+  "foods": [
+    {"x": 7, "y": 22},
+    {"x": 3, "y": 5}
   ]
 }
 ```
+
+`cells[0]` is the head. `score` is not included in the broadcast payload.
 
 ---
 
 ## Configuration
 
-All keys use MicroProfile Config (`application.properties`). The API key is supplied via the environment variable `LLM_API_KEY`, which MicroProfile Config maps automatically to the property below.
+All keys use MicroProfile Config (`application.properties`). The API key is supplied via environment variable `LLM_API_KEY`.
 
 | Key | Default | Description |
 |---|---|---|
-| `quarkus.langchain4j.google-ai-gemini.api-key` | `${LLM_API_KEY}` | Google API key for Gemini — set via env var `LLM_API_KEY` |
-| `quarkus.langchain4j.google-ai-gemini.model-name` | `gemini-4-flash` | Gemini model ID |
+| `quarkus.langchain4j.ai.gemini.api-key` | `${LLM_API_KEY}` | Google API key for Gemini — set via env var `LLM_API_KEY` |
+| `quarkus.langchain4j.ai.gemini.model-name` | `gemini-4-flash` | Gemini model ID |
 | `game.grid.size` | `30` | Board side length (square) |
-| `simulation.max-steps` | `5000` | Hard cap on steps per run to avoid infinite loops (declared; not yet enforced in v1) |
-| `simulation.tick-interval` | `200ms` | Fixed interval between engine ticks (`@Scheduled(every = "${simulation.tick-interval:200ms}")`) |
+| `game.tick.interval` | `200ms` | Fixed interval between engine ticks (`@Scheduled(every = "${game.tick.interval:200ms}")`) |
+| `game.food.max` | `5` | Maximum simultaneous food items |
+| `game.snake.initial-length` | `3` | Snake length at spawn |
 
 ---
 
@@ -269,28 +249,23 @@ All keys use MicroProfile Config (`application.properties`). The API key is supp
 
 ## Data Flow per Tick
 
-The tick loop and the agent are fully decoupled via the single-slot mailbox on `GameSession`.
-
 ```
-[Quarkus Scheduler — every 200 ms]
+[Quarkus Scheduler — every 200 ms, virtual thread]
   │
-  SimulationRunner.tick()
-    ├─ 1. direction = GameSession.latestDirection()           ← AtomicReference read, never blocks
-    ├─ 2. state    = GameEngine.advance(current, direction)   → move, collision, food resolution
-    ├─ 3. GameSession.record(state)
-    ├─ 4. GameSocket.broadcast(renderState(state))            ← push to all WS clients, non-blocking
-    ├─ 5. if game over → stop scheduler, return
-    ├─ 6. GameSession.pendingState.set(state)                 ← overwrite; old state dropped
-    └─ 7. if GameSession.agentBusy.compareAndSet(false, true) → dispatch async agent call (*)
-           else → skip (agent already processing a more recent state)
+  GameEngine.tick()
+    ├─ 1. gameState.applyDirection(latestDirection.get())     ← AtomicReference read; null = keep current direction
+    ├─ 2. gameState.advance()                                 → move, reversal guard, collision check, food resolution
+    ├─ 3. state = gameState.toRenderState()                   ← immutable RenderState snapshot
+    ├─ 4. broadcaster.broadcast(serialize(state))             ← push JSON to all WS clients
+    └─ 5. if snake alive AND agentBusy.compareAndSet(false, true):
+              AGENT_EXECUTOR.execute(() -> decideAsync(state))
+           else: skip (agent busy or game over)
 
-(*) Async agent call (background thread):
-    ├─ a. state  = GameSession.pendingState.getAndSet(null)   ← consume latest
-    ├─ b. dir    = callAgent(state)   ← builds prompt, calls SnakeAgent.decide(prompt), parses String → Direction
-    ├─ c. GameSession.latestDirection.set(dir)
-    ├─ d. next   = GameSession.pendingState.getAndSet(null)   ← any state arrived while busy?
-    └─ e. if next != null → loop back to (b) with next       ← process immediately
-           else           → GameSession.agentBusy.set(false) ← release lock
+decideAsync(state) — virtual thread:
+    ├─ a. prompt = buildPrompt(state)                         ← head, 4 moves with safety + wall-distance, food
+    ├─ b. raw    = snakeAgent.decide(prompt)                  ← Gemini HTTP call
+    ├─ c. latestDirection.set(Direction.parse(raw))
+    └─ d. agentBusy.set(false)   [always, in finally block]
 ```
 
 ---
